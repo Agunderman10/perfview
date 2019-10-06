@@ -807,6 +807,11 @@ namespace PerfView
                 stackWindow.FoldRegExTextBox.Items.Add("ntoskrnl!%ServiceCopyEnd");
             }
 
+            ConfigureGroupRegExTextBox(stackWindow, windows);
+        }
+
+        internal static void ConfigureGroupRegExTextBox(StackWindow stackWindow, bool windows)
+        {
             stackWindow.GroupRegExTextBox.Text = stackWindow.GetDefaultGroupPat();
             stackWindow.GroupRegExTextBox.Items.Clear();
             stackWindow.GroupRegExTextBox.Items.Add(@"[no grouping]");
@@ -820,6 +825,7 @@ namespace PerfView
             stackWindow.GroupRegExTextBox.Items.Add(@"[group full path module entries]  {*}!=>module $1");
             stackWindow.GroupRegExTextBox.Items.Add(@"[group class entries]     {%!*}.%(=>class $1;{%!*}::=>class $1");
             stackWindow.GroupRegExTextBox.Items.Add(@"[group classes]            {%!*}.%(->class $1;{%!*}::->class $1");
+            stackWindow.GroupRegExTextBox.Items.Add(@"[fold threads]            Thread -> AllThreads");
         }
 
         // ideally this function would not exist.  Does the open logic on the current thread (likely GUI thread)
@@ -887,23 +893,9 @@ namespace PerfView
             if (caller == StackSourceCallStackIndex.Invalid)
             {
                 string topCallStackStr = stackSource.GetFrameName(stackSource.GetFrameIndex(callStack), true);
-                Match m = Regex.Match(topCallStackStr, @"^Process\d*\s+([^()]*?)\s*(\(\s*(\d+)\s*\))?\s*$");
-                if (m.Success)
+                
+                if (GetProcessForStackSourceFromTopCallStackFrame(topCallStackStr, out ret))
                 {
-                    var processIDStr = m.Groups[3].Value;
-                    var processName = m.Groups[1].Value;
-                    if (processName.Length == 0)
-                    {
-                        processName = "(" + processIDStr + ")";
-                    }
-
-                    ret = new IProcessForStackSource(processName);
-                    int processID;
-                    if (int.TryParse(processIDStr, out processID))
-                    {
-                        ret.ProcessID = processID;
-                    }
-
                     processes.Add(ret);
                 }
             }
@@ -914,6 +906,51 @@ namespace PerfView
 
             rootMostFrameCache.Add(callStack, ret);
             return ret;
+        }
+
+        internal virtual string GetProcessIncPat(IProcess process) => $"Process% {process.Name} ({process.ProcessID})";
+
+        /// <summary>
+        /// This is and ugly routine that scrapes the data to find the full path (without the .exe extension) of the
+        /// exe in the program.   It may fail (return nulls).   
+        /// </summary>
+        internal virtual string FindExeName(string incPat)
+        {
+            string procName = null;
+            if (!string.IsNullOrWhiteSpace(incPat))
+            {
+                Match m = Regex.Match(incPat, @"^Process%\s+([^();]+[^(); ])", RegexOptions.IgnoreCase);
+                if (m.Success)
+                {
+                    procName = m.Groups[1].Value;
+                }
+            }
+            return procName;
+        }
+
+        internal virtual bool GetProcessForStackSourceFromTopCallStackFrame(string topCallStackStr, out IProcessForStackSource result)
+        {
+            Match m = Regex.Match(topCallStackStr, @"^Process\d*\s+([^()]*?)\s*(\(\s*(\d+)\s*\))?\s*$");
+            if (m.Success)
+            {
+                var processIDStr = m.Groups[3].Value;
+                var processName = m.Groups[1].Value;
+                if (processName.Length == 0)
+                {
+                    processName = "(" + processIDStr + ")";
+                }
+
+                result = new IProcessForStackSource(processName);
+                if (int.TryParse(processIDStr, out int processID))
+                {
+                    result.ProcessID = processID;
+                }
+
+                return true;
+            }
+
+            result = null;
+            return false;
         }
 
         protected bool IsMyFormat(string fileName)
@@ -3594,7 +3631,7 @@ table {
                     {
                         traceLog = ((ETLPerfViewData)DataFile).GetTraceLog(worker.LogWriter);
                     }
-                    else if(DataFile is EventPipePerfViewData)
+                    else if (DataFile is EventPipePerfViewData)
                     {
                         traceLog = ((EventPipePerfViewData)DataFile).GetTraceLog(worker.LogWriter);
                     }
@@ -3814,6 +3851,12 @@ table {
         public override string FilePath { get { return DataFile.FilePath; } }
         public override void Open(Window parentWindow, StatusBar worker, Action doAfter = null)
         {
+            // The OS Heap Alloc stack source has logic to look up type names from PDBs, we only do this
+            // lookup when we initially create the stack source.  To allow the user to fetch more PDBs and 
+            // try again, we remove the caching of the StackSource so re-opening recomputes the stack source.   
+            if (Name.StartsWith("Net OS Heap Alloc"))
+                m_StackSource = null;
+
             if (Viewer == null || !DataFile.IsUpToDate)
             {
                 worker.StartWork("Opening " + Name, delegate ()
@@ -3863,8 +3906,12 @@ table {
                                         incPat += "|";
                                     }
 
-                                    incPat += "Process% " + process.Name + " (" + process.ProcessID + ")";
-                                    processIDs.Add(process.ProcessID);
+                                    incPat += DataFile.GetProcessIncPat(process);
+
+                                    if (process.ProcessID != default) // process ID is not always available
+                                    {
+                                        processIDs.Add(process.ProcessID);
+                                    }
                                 }
                                 SetProcessFilter(incPat);
                             }
@@ -4120,7 +4167,7 @@ table {
     public partial class ETLPerfViewData : PerfViewFile
     {
         public override string FormatName { get { return "ETW"; } }
-        public override string[] FileExtensions { get { return new string[] { ".etl", ".etlx", ".etl.zip", ".vspx" }; } }
+        public override string[] FileExtensions { get { return new string[] { ".btl", ".etl", ".etlx", ".etl.zip", ".vspx" }; } }
 
         protected internal override EventSource OpenEventSourceImpl(TextWriter log)
         {
@@ -5297,11 +5344,11 @@ table {
                         }
                     }
 
-                    ADD_EVENT_FRAME:
+                ADD_EVENT_FRAME:
                     // Tack on event name 
                     var eventNodeName = "Event " + data.ProviderName + "/" + data.EventName;
                     stackIndex = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern(eventNodeName), stackIndex);
-                    ADD_SAMPLE:
+                ADD_SAMPLE:
                     sample.StackIndex = stackIndex;
                     sample.TimeRelativeMSec = data.TimeStampRelativeMSec;
                     sample.Metric = 1;
@@ -5627,78 +5674,78 @@ table {
                 var memStates = new MemState[eventLog.Processes.Count];
                 var virtualReserverFrame = stackSource.Interner.FrameIntern("VirtualReserve");
                 eventSource.Kernel.AddCallbackForEvents<VirtualAllocTraceData>(delegate (VirtualAllocTraceData data)
-                                {
-                                    bool isAlloc = false;
-                                    if ((data.Flags & (
-                                        VirtualAllocTraceData.VirtualAllocFlags.MEM_COMMIT |
-                                        VirtualAllocTraceData.VirtualAllocFlags.MEM_RESERVE |
-                                        VirtualAllocTraceData.VirtualAllocFlags.MEM_RELEASE)) != 0)
-                                    {
-                                        // Can't use data.Process() because some of the virtual allocs occur in the process that started the
-                                        // process and occur before the process start event, which is what Process() uses to find it. 
-                                        // TODO this code assumes that process launch is within 1 second and process IDs are not aggressively reused. 
-                                        var processWhereMemoryAllocated = data.Log().Processes.GetProcess(data.ProcessID, data.TimeStampRelativeMSec + 1000);
-                                        if (processWhereMemoryAllocated == null)
-                                        {
-                                            droppedEvents++;
-                                            return;
-                                        }
+                {
+                    bool isAlloc = false;
+                    if ((data.Flags & (
+                        VirtualAllocTraceData.VirtualAllocFlags.MEM_COMMIT |
+                        VirtualAllocTraceData.VirtualAllocFlags.MEM_RESERVE |
+                        VirtualAllocTraceData.VirtualAllocFlags.MEM_RELEASE)) != 0)
+                    {
+                        // Can't use data.Process() because some of the virtual allocs occur in the process that started the
+                        // process and occur before the process start event, which is what Process() uses to find it. 
+                        // TODO this code assumes that process launch is within 1 second and process IDs are not aggressively reused. 
+                        var processWhereMemoryAllocated = data.Log().Processes.GetProcess(data.ProcessID, data.TimeStampRelativeMSec + 1000);
+                        if (processWhereMemoryAllocated == null)
+                        {
+                            droppedEvents++;
+                            return;
+                        }
 
-                                        var processIndex = processWhereMemoryAllocated.ProcessIndex;
-                                        var memState = memStates[(int)processIndex];
-                                        if (memState == null)
-                                        {
-                                            memState = memStates[(int)processIndex] = new MemState();
-                                        }
+                        var processIndex = processWhereMemoryAllocated.ProcessIndex;
+                        var memState = memStates[(int)processIndex];
+                        if (memState == null)
+                        {
+                            memState = memStates[(int)processIndex] = new MemState();
+                        }
 
-                                        // Commit and decommit not both on together.  
-                                        Debug.Assert((data.Flags &
-                                                                    (VirtualAllocTraceData.VirtualAllocFlags.MEM_COMMIT | VirtualAllocTraceData.VirtualAllocFlags.MEM_DECOMMIT)) !=
-                                                                    (VirtualAllocTraceData.VirtualAllocFlags.MEM_COMMIT | VirtualAllocTraceData.VirtualAllocFlags.MEM_DECOMMIT));
-                                        // Reserve and release not both on together.
-                                        Debug.Assert((data.Flags &
-                                                            (VirtualAllocTraceData.VirtualAllocFlags.MEM_RESERVE | VirtualAllocTraceData.VirtualAllocFlags.MEM_RELEASE)) !=
-                                                            (VirtualAllocTraceData.VirtualAllocFlags.MEM_RESERVE | VirtualAllocTraceData.VirtualAllocFlags.MEM_RELEASE));
+                        // Commit and decommit not both on together.  
+                        Debug.Assert((data.Flags &
+                                                    (VirtualAllocTraceData.VirtualAllocFlags.MEM_COMMIT | VirtualAllocTraceData.VirtualAllocFlags.MEM_DECOMMIT)) !=
+                                                    (VirtualAllocTraceData.VirtualAllocFlags.MEM_COMMIT | VirtualAllocTraceData.VirtualAllocFlags.MEM_DECOMMIT));
+                        // Reserve and release not both on together.
+                        Debug.Assert((data.Flags &
+                                            (VirtualAllocTraceData.VirtualAllocFlags.MEM_RESERVE | VirtualAllocTraceData.VirtualAllocFlags.MEM_RELEASE)) !=
+                                            (VirtualAllocTraceData.VirtualAllocFlags.MEM_RESERVE | VirtualAllocTraceData.VirtualAllocFlags.MEM_RELEASE));
 
-                                        // You allocate by committing or reserving.  We have already filtered out decommits which have no effect on reservation.  
-                                        // Thus the only memRelease is the only one that frees.  
-                                        var stackIndex = StackSourceCallStackIndex.Invalid;
-                                        if ((data.Flags & (VirtualAllocTraceData.VirtualAllocFlags.MEM_COMMIT | VirtualAllocTraceData.VirtualAllocFlags.MEM_RESERVE)) != 0)
-                                        {
-                                            isAlloc = true;
-                                            // Some of the early allocations are actually by the process that starts this process.  Don't use their stacks 
-                                            // But do count them.  
-                                            var processIDAllocatingMemory = processWhereMemoryAllocated.ProcessID;  // This is not right, but it sets the condition properly below 
-                                            var thread = data.Thread();
-                                            if (thread != null)
-                                            {
-                                                processIDAllocatingMemory = thread.Process.ProcessID;
-                                            }
+                        // You allocate by committing or reserving.  We have already filtered out decommits which have no effect on reservation.  
+                        // Thus the only memRelease is the only one that frees.  
+                        var stackIndex = StackSourceCallStackIndex.Invalid;
+                        if ((data.Flags & (VirtualAllocTraceData.VirtualAllocFlags.MEM_COMMIT | VirtualAllocTraceData.VirtualAllocFlags.MEM_RESERVE)) != 0)
+                        {
+                            isAlloc = true;
+                            // Some of the early allocations are actually by the process that starts this process.  Don't use their stacks 
+                            // But do count them.  
+                            var processIDAllocatingMemory = processWhereMemoryAllocated.ProcessID;  // This is not right, but it sets the condition properly below 
+                            var thread = data.Thread();
+                            if (thread != null)
+                            {
+                                processIDAllocatingMemory = thread.Process.ProcessID;
+                            }
 
-                                            if (data.TimeStampRelativeMSec >= processWhereMemoryAllocated.StartTimeRelativeMsec && processIDAllocatingMemory == processWhereMemoryAllocated.ProcessID)
-                                            {
-                                                stackIndex = stackSource.GetCallStack(data.CallStackIndex(), data);
-                                            }
-                                            else
-                                            {
-                                                stackIndex = stackSource.GetCallStackForProcess(processWhereMemoryAllocated);
-                                                stackIndex = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern("Allocated In Parent Process"), stackIndex);
-                                            }
-                                            stackIndex = stackSource.Interner.CallStackIntern(virtualReserverFrame, stackIndex);
-                                        }
-                                        memState.Update(data.BaseAddr, data.Length, isAlloc, stackIndex,
-                                            delegate (long metric, StackSourceCallStackIndex allocStack)
-                                            {
-                                                Debug.Assert(allocStack != StackSourceCallStackIndex.Invalid);
-                                                Debug.Assert(metric != 0);                                                  // They should trim this already.  
-                                                sample.Metric = metric;
-                                                sample.TimeRelativeMSec = data.TimeStampRelativeMSec;
-                                                sample.StackIndex = allocStack;
-                                                stackSource.AddSample(sample);
-                                                // Debug.WriteLine("Sample Proc {0,12} Time {1,8:f3} Length 0x{2:x} Metric 0x{3:x} Stack {4,8} Cum {5,8}", process.Name, sample.TimeRelativeMSec, data.Length, (int) sample.Metric, (int)sample.StackIndex, memState.TotalMem);
-                                            });
-                                    }
-                                });
+                            if (data.TimeStampRelativeMSec >= processWhereMemoryAllocated.StartTimeRelativeMsec && processIDAllocatingMemory == processWhereMemoryAllocated.ProcessID)
+                            {
+                                stackIndex = stackSource.GetCallStack(data.CallStackIndex(), data);
+                            }
+                            else
+                            {
+                                stackIndex = stackSource.GetCallStackForProcess(processWhereMemoryAllocated);
+                                stackIndex = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern("Allocated In Parent Process"), stackIndex);
+                            }
+                            stackIndex = stackSource.Interner.CallStackIntern(virtualReserverFrame, stackIndex);
+                        }
+                        memState.Update(data.BaseAddr, data.Length, isAlloc, stackIndex,
+                            delegate (long metric, StackSourceCallStackIndex allocStack)
+                            {
+                                Debug.Assert(allocStack != StackSourceCallStackIndex.Invalid);
+                                Debug.Assert(metric != 0);                                                  // They should trim this already.  
+                                sample.Metric = metric;
+                                sample.TimeRelativeMSec = data.TimeStampRelativeMSec;
+                                sample.StackIndex = allocStack;
+                                stackSource.AddSample(sample);
+                                // Debug.WriteLine("Sample Proc {0,12} Time {1,8:f3} Length 0x{2:x} Metric 0x{3:x} Stack {4,8} Cum {5,8}", process.Name, sample.TimeRelativeMSec, data.Length, (int) sample.Metric, (int)sample.StackIndex, memState.TotalMem);
+                            });
+                    }
+                });
                 eventSource.Process();
                 if (droppedEvents != 0)
                 {
@@ -5713,6 +5760,12 @@ table {
                 var heapParser = new HeapTraceProviderTraceEventParser(eventSource);
                 Dictionary<Address, StackSourceSample> lastHeapAllocs = null;
 
+                // These three variables are used in the local function GetAllocationType defined below.
+                // and are used to look up type names associated with the native allocations.   
+                var loadedModules = new Dictionary<TraceModuleFile, NativeSymbolModule>();
+                var allocationTypeNames = new Dictionary<CallStackIndex, string>();
+                var symReader = GetSymbolReader(log, SymbolReaderOptions.CacheOnly);
+
                 Address lastHeapHandle = 0;
 
                 float peakMetric = 0;
@@ -5722,29 +5775,78 @@ table {
                 int cumCount = 0;
 
                 heapParser.HeapTraceAlloc += delegate (HeapAllocTraceData data)
+                {
+                    var allocs = lastHeapAllocs;
+                    if (data.HeapHandle != lastHeapHandle)
+                        allocs = GetHeap(data.HeapHandle, heaps, ref lastHeapAllocs, ref lastHeapHandle);
+
+                    var callStackIndex = data.CallStackIndex();
+                    sample.TimeRelativeMSec = data.TimeStampRelativeMSec;
+                    sample.Metric = data.AllocSize;
+                    sample.StackIndex = stackSource.GetCallStack(callStackIndex, data);
+
+                    // Add the 'Alloc < XXX' psuedo node. 
+                    var nodeIndex = stackSource.Interner.FrameIntern(GetAllocName((uint)data.AllocSize));
+                    sample.StackIndex = stackSource.Interner.CallStackIntern(nodeIndex, sample.StackIndex);
+
+                    // Add the 'Type ALLOCATION_TYPE' if available.  
+                    string allocationType = GetAllocationType(callStackIndex);
+                    if (allocationType != null)
+                    {
+                        nodeIndex = stackSource.Interner.FrameIntern("Type " + allocationType);
+                        sample.StackIndex = stackSource.Interner.CallStackIntern(nodeIndex, sample.StackIndex);
+                    }
+
+                    var addedSample = stackSource.AddSample(sample);
+                    allocs[data.AllocAddress] = addedSample;
+
+                    cumMetric += sample.Metric;
+                    if (cumMetric > peakMetric)
+                    {
+                        peakMetric = cumMetric;
+                        peakSample = addedSample;
+                    }
+                    sumCumMetric += cumMetric;
+                    cumCount++;
+
+                    /*****************************************************************************/
+                    // Performs a stack crawl to match the best typename to this allocation. 
+                    // Returns null if no typename was found.
+                    // This updates loadedModules and allocationTypeNames. It reads symReader/eventLog.
+                    string GetAllocationType(CallStackIndex csi)
+                    {
+                        if (!allocationTypeNames.TryGetValue(csi, out var typeName))
+                        {
+                            const int frameLimit = 25; // typically you need about 10 frames to get out of the OS functions 
+                                                       // to get to a frame that has type information.   We'll search up this many frames
+                                                       // before giving up on getting type information for the allocation.  
+
+                            int frameCount = 0;
+                            for (var current = csi; current != CallStackIndex.Invalid && frameCount < frameLimit; current = eventLog.CallStacks.Caller(current), frameCount++)
+                            {
+                                var module = eventLog.CodeAddresses.ModuleFile(eventLog.CallStacks.CodeAddressIndex(current));
+                                if (module == null)
+                                    continue;
+
+                                if (!loadedModules.TryGetValue(module, out var symbolModule))
                                 {
-                                    var allocs = lastHeapAllocs;
-                                    if (data.HeapHandle != lastHeapHandle)
-                                    {
-                                        allocs = GetHeap(data.HeapHandle, heaps, ref lastHeapAllocs, ref lastHeapHandle);
-                                    }
+                                    loadedModules[module] = symbolModule =
+                                        (module.PdbSignature != Guid.Empty
+                                            ? symReader.FindSymbolFilePath(module.PdbName, module.PdbSignature, module.PdbAge, module.FilePath)
+                                            : symReader.FindSymbolFilePathForModule(module.FilePath)) is string pdb
+                                        ? symReader.OpenNativeSymbolFile(pdb)
+                                        : null;
+                                }
 
-                                    sample.TimeRelativeMSec = data.TimeStampRelativeMSec;
-                                    sample.Metric = data.AllocSize;
-                                    var nodeIndex = stackSource.Interner.FrameIntern(GetAllocName((uint)data.AllocSize));
-                                    sample.StackIndex = stackSource.Interner.CallStackIntern(nodeIndex, stackSource.GetCallStack(data.CallStackIndex(), data));
-                                    var addedSample = stackSource.AddSample(sample);
-                                    allocs[data.AllocAddress] = addedSample;
-
-                                    cumMetric += sample.Metric;
-                                    if (cumMetric > peakMetric)
-                                    {
-                                        peakMetric = cumMetric;
-                                        peakSample = addedSample;
-                                    }
-                                    sumCumMetric += cumMetric;
-                                    cumCount++;
-                                };
+                                typeName = symbolModule?.GetTypeForHeapAllocationSite(
+                                        (uint)(eventLog.CodeAddresses.Address(eventLog.CallStacks.CodeAddressIndex(current)) - module.ImageBase)
+                                    ) ?? typeName;
+                            }
+                            allocationTypeNames[csi] = typeName;
+                        }
+                        return typeName;
+                    }
+                };
 
                 heapParser.HeapTraceFree += delegate (HeapFreeTraceData data)
                 {
@@ -6593,6 +6695,23 @@ table {
             {
                 stackWindow.ExtraTopStats = m_extraTopStats;
             }
+
+            // Warn the user about the behavior of type name lookup, but only once per user.  
+            if (stackSourceName == "Net OS Heap Alloc")
+            {
+                if (App.ConfigData["WarnedAboutOsHeapAllocTypes"] == null)
+                {
+                    MessageBox.Show(stackWindow, 
+                        "Warning: Allocation type resolution only happens on window launch.\r\n" +
+                        "Thus if you manually lookup symbols in this view you will get method\r\n" +
+                        "names of allocations sites, but to get the type name associated the \r\n" +
+                        "allocation site.\r\n" +
+                        "\r\n" +
+                        "You must close and reopen this window to get the allocation types.\r\n"
+                        , "May need to resolve PDBs and reopen.");
+                    App.ConfigData["WarnedAboutOsHeapAllocTypes"] = "true";
+                }
+            }
         }
         public override bool SupportsProcesses { get { return true; } }
 
@@ -7124,7 +7243,7 @@ table {
 
             var etlxFile = dataFileName;
             var cachedEtlxFile = false;
-            if (dataFileName.EndsWith(".etl", StringComparison.OrdinalIgnoreCase))
+            if (dataFileName.EndsWith(".etl", StringComparison.OrdinalIgnoreCase) || dataFileName.EndsWith(".btl", StringComparison.OrdinalIgnoreCase))
             {
                 etlxFile = CacheFiles.FindFile(dataFileName, ".etlx");
                 if (!File.Exists(etlxFile))
@@ -8138,6 +8257,24 @@ table {
 
         public override string[] FileExtensions { get { return new string[] { ".trace.zip" }; } }
 
+        public override bool SupportsProcesses => true;
+
+        internal override string GetProcessIncPat(IProcess process) => process.Name;
+
+        internal override string FindExeName(string incPat) => string.IsNullOrEmpty(incPat) ? incPat : incPat.Split('|').FirstOrDefault();
+
+        internal override bool GetProcessForStackSourceFromTopCallStackFrame(string topCallStackStr, out IProcessForStackSource result)
+        {
+            if (!string.IsNullOrEmpty(topCallStackStr))
+            {
+                // the top call stack is always process name, the process ID is missing as of today (a perf_events limitation)
+                result = new IProcessForStackSource(topCallStackStr);
+                return true;
+            }
+            result = null;
+            return false;
+        }
+
         protected internal override EventSource OpenEventSourceImpl(TextWriter log)
         {
             var traceLog = GetTraceLog(log);
@@ -8249,6 +8386,8 @@ table {
         {
             stackWindow.ScalingPolicy = ScalingPolicyKind.TimeMetric;
             stackWindow.GroupRegExTextBox.Text = stackWindow.GetDefaultGroupPat();
+
+            ConfigureGroupRegExTextBox(stackWindow, windows: false);
         }
 
         public TraceLog GetTraceLog(TextWriter log)
@@ -8349,7 +8488,9 @@ table {
     {
         public override string FormatName => "EventPipe";
 
-        public override string[] FileExtensions => new string[] { ".netperf", ".netperf.zip" };
+        public override string[] FileExtensions => new string[] { ".netperf", ".netperf.zip", ".nettrace" };
+
+        private string m_extraTopStats;
 
         protected internal override EventSource OpenEventSourceImpl(TextWriter log)
         {
@@ -8366,6 +8507,9 @@ table {
             bool hasJIT = false;
             bool hasAnyStacks = false;
             bool hasDotNetHeapDumps = false;
+            bool hasGCAllocationTicks = false;
+            bool hasObjectUpdate = false;
+            bool hasMemAllocStacks = false;
             if (m_traceLog != null)
             {
                 foreach (TraceEventCounts eventStats in m_traceLog.Stats)
@@ -8386,6 +8530,18 @@ table {
                     else if (eventStats.EventName.StartsWith("GC/BulkNode"))
                     {
                         hasDotNetHeapDumps = true;
+                    }
+                    else if (eventStats.EventName.StartsWith("GC/AllocationTick"))
+                    {
+                        hasGCAllocationTicks = true;
+                    }
+                    if (eventStats.EventName.StartsWith("GC/BulkSurvivingObjectRanges") || eventStats.EventName.StartsWith("GC/BulkMovedObjectRanges"))
+                    {
+                        hasObjectUpdate = true;
+                    }
+                    if (eventStats.EventName.StartsWith("GC/SampledObjectAllocation"))
+                    {
+                        hasMemAllocStacks = true;
                     }
                 }
             }
@@ -8408,6 +8564,22 @@ table {
                 if (hasGC)
                 {
                     memory.AddChild(new PerfViewGCStats(this));
+                }
+
+                if (hasGCAllocationTicks)
+                {
+                    if (hasObjectUpdate)
+                    {
+                        memory.Children.Add(new PerfViewStackSource(this, "GC Heap Net Mem (Coarse Sampling)"));
+                        memory.Children.Add(new PerfViewStackSource(this, "Gen 2 Object Deaths (Coarse Sampling)"));
+                    }
+                    memory.Children.Add(new PerfViewStackSource(this, "GC Heap Alloc Ignore Free (Coarse Sampling)"));
+                }
+                if (hasMemAllocStacks)
+                {
+                    memory.Children.Add(new PerfViewStackSource(this, "GC Heap Net Mem"));
+                    memory.Children.Add(new PerfViewStackSource(this, "GC Heap Alloc Ignore Free"));
+                    memory.Children.Add(new PerfViewStackSource(this, "Gen 2 Object Deaths"));
                 }
 
                 if (hasDotNetHeapDumps)
@@ -8490,8 +8662,8 @@ table {
                                     goto ADD_EVENT_FRAME;
                                 }
 
-                                // Tack on event nam
-                                ADD_EVENT_FRAME:
+                            // Tack on event nam
+                            ADD_EVENT_FRAME:
                                 var eventNodeName = "Event " + data.ProviderName + "/" + data.EventName;
                                 stackIndex = stackSource.Interner.CallStackIntern(stackSource.Interner.FrameIntern(eventNodeName), stackIndex);
                                 // Add sample
@@ -8519,14 +8691,178 @@ table {
 
                         return startStopSource;
                     }
+                case "GC Heap Alloc Ignore Free":
+                    {
+                        var eventLog = GetTraceLog(log);
+                        var eventSource = eventLog.Events.GetSource();
+                        var stackSource = new MutableTraceEventStackSource(eventLog);
+                        var sample = new StackSourceSample(stackSource);
+
+                        var gcHeapSimulators = new GCHeapSimulators(eventLog, eventSource, stackSource, log);
+                        gcHeapSimulators.OnNewGCHeapSimulator = delegate (GCHeapSimulator newHeap)
+                        {
+                            newHeap.OnObjectCreate += delegate (Address objAddress, GCHeapSimulatorObject objInfo)
+                            {
+                                sample.Metric = objInfo.RepresentativeSize;
+                                sample.Count = objInfo.RepresentativeSize / objInfo.Size;                                               // We guess a count from the size.  
+                                sample.TimeRelativeMSec = objInfo.AllocationTimeRelativeMSec;
+                                sample.StackIndex = stackSource.Interner.CallStackIntern(objInfo.ClassFrame, objInfo.AllocStack);        // Add the type as a pseudo frame.  
+                                stackSource.AddSample(sample);
+                                return true;
+                            };
+                        };
+                        eventSource.Process();
+                        stackSource.DoneAddingSamples();
+
+                        return stackSource;
+                    }
                 default:
-                    return null;
+                    {
+                        var eventLog = GetTraceLog(log);
+                        var eventSource = eventLog.Events.GetSource();
+                        var stackSource = new MutableTraceEventStackSource(eventLog);
+                        var sample = new StackSourceSample(stackSource);
+
+                        if (streamName.StartsWith("GC Heap Net Mem"))
+                        {
+                            var gcHeapSimulators = new GCHeapSimulators(eventLog, eventSource, stackSource, log);
+                            if (streamName == "GC Heap Net Mem (Coarse Sampling)")
+                            {
+                                gcHeapSimulators.UseOnlyAllocTicks = true;
+                                m_extraTopStats = "Sampled only 100K bytes";
+                            }
+
+                            gcHeapSimulators.OnNewGCHeapSimulator = delegate (GCHeapSimulator newHeap)
+                            {
+                                newHeap.OnObjectCreate += delegate (Address objAddress, GCHeapSimulatorObject objInfo)
+                                {
+                                    sample.Metric = objInfo.RepresentativeSize;
+                                    sample.Count = objInfo.RepresentativeSize / objInfo.Size;                                                // We guess a count from the size.  
+                                sample.TimeRelativeMSec = objInfo.AllocationTimeRelativeMSec;
+                                    sample.StackIndex = stackSource.Interner.CallStackIntern(objInfo.ClassFrame, objInfo.AllocStack);        // Add the type as a pseudo frame.  
+                                stackSource.AddSample(sample);
+                                    return true;
+                                };
+                                newHeap.OnObjectDestroy += delegate (double time, int gen, Address objAddress, GCHeapSimulatorObject objInfo)
+                                {
+                                    sample.Metric = -objInfo.RepresentativeSize;
+                                    sample.Count = -(objInfo.RepresentativeSize / objInfo.Size);                                            // We guess a count from the size.  
+                                sample.TimeRelativeMSec = time;
+                                    sample.StackIndex = stackSource.Interner.CallStackIntern(objInfo.ClassFrame, objInfo.AllocStack);       // We remove the same stack we added at alloc.  
+                                stackSource.AddSample(sample);
+                                };
+
+                                newHeap.OnGC += delegate (double time, int gen)
+                                {
+                                    sample.Metric = float.Epsilon;
+                                    sample.Count = 1;
+                                    sample.TimeRelativeMSec = time;
+                                    StackSourceCallStackIndex processStack = stackSource.GetCallStackForProcess(newHeap.Process);
+                                    StackSourceFrameIndex gcFrame = stackSource.Interner.FrameIntern("GC Occured Gen(" + gen + ")");
+                                    sample.StackIndex = stackSource.Interner.CallStackIntern(gcFrame, processStack);
+                                    stackSource.AddSample(sample);
+                                };
+                            };
+                            eventSource.Process();
+                            stackSource.DoneAddingSamples();
+                        }
+                        else if (streamName.StartsWith("Gen 2 Object Deaths"))
+                        {
+                            var gcHeapSimulators = new GCHeapSimulators(eventLog, eventSource, stackSource, log);
+
+                            if (streamName == "Gen 2 Object Deaths (Coarse Sampling)")
+                            {
+                                gcHeapSimulators.UseOnlyAllocTicks = true;
+                                m_extraTopStats = "Sampled only 100K bytes";
+                            }
+
+                            gcHeapSimulators.OnNewGCHeapSimulator = delegate (GCHeapSimulator newHeap)
+                            {
+                                newHeap.OnObjectDestroy += delegate (double time, int gen, Address objAddress, GCHeapSimulatorObject objInfo)
+                                {
+                                    if (2 <= gen)
+                                    {
+                                        sample.Metric = objInfo.RepresentativeSize;
+                                        sample.Count = (objInfo.RepresentativeSize / objInfo.Size);                                         // We guess a count from the size.  
+                                    sample.TimeRelativeMSec = objInfo.AllocationTimeRelativeMSec;
+                                        sample.StackIndex = stackSource.Interner.CallStackIntern(objInfo.ClassFrame, objInfo.AllocStack);
+                                        stackSource.AddSample(sample);
+                                    }
+                                };
+
+                                newHeap.OnGC += delegate (double time, int gen)
+                                {
+                                    sample.Metric = float.Epsilon;
+                                    sample.Count = 1;
+                                    sample.TimeRelativeMSec = time;
+                                    StackSourceCallStackIndex processStack = stackSource.GetCallStackForProcess(newHeap.Process);
+                                    StackSourceFrameIndex gcFrame = stackSource.Interner.FrameIntern("GC Occured Gen(" + gen + ")");
+                                    sample.StackIndex = stackSource.Interner.CallStackIntern(gcFrame, processStack);
+                                    stackSource.AddSample(sample);
+                                };
+                            };
+
+                            eventSource.Process();
+                            stackSource.DoneAddingSamples();
+                        }
+                        else if (streamName == "GC Heap Alloc Ignore Free (Coarse Sampling)")
+                        {
+                            TypeNameSymbolResolver typeNameSymbolResolver = new TypeNameSymbolResolver(FilePath, log);
+
+                            bool seenBadAllocTick = false;
+
+                            eventSource.Clr.GCAllocationTick += delegate (GCAllocationTickTraceData data)
+                            {
+                                sample.TimeRelativeMSec = data.TimeStampRelativeMSec;
+
+                                var stackIndex = stackSource.GetCallStack(data.CallStackIndex(), data);
+
+                                var typeName = data.TypeName;
+                                if (string.IsNullOrEmpty(typeName))
+                                {
+                                // Attempt to resolve the type name.
+                                TraceLoadedModule module = data.Process().LoadedModules.GetModuleContainingAddress(data.TypeID, data.TimeStampRelativeMSec);
+                                    if (module != null)
+                                    {
+                                    // Resolve the type name.
+                                    typeName = typeNameSymbolResolver.ResolveTypeName((int)(data.TypeID - module.ModuleFile.ImageBase), module.ModuleFile, TypeNameSymbolResolver.TypeNameOptions.StripModuleName);
+                                    }
+                                }
+
+                                if (typeName != null && typeName.Length > 0)
+                                {
+                                    var nodeIndex = stackSource.Interner.FrameIntern("Type " + typeName);
+                                    stackIndex = stackSource.Interner.CallStackIntern(nodeIndex, stackIndex);
+                                }
+
+                                sample.Metric = data.GetAllocAmount(ref seenBadAllocTick);
+
+                                if (data.AllocationKind == GCAllocationKind.Large)
+                                {
+
+                                    var nodeIndex = stackSource.Interner.FrameIntern("LargeObject");
+                                    stackIndex = stackSource.Interner.CallStackIntern(nodeIndex, stackIndex);
+                                }
+
+                                sample.StackIndex = stackIndex;
+                                stackSource.AddSample(sample);
+                            };
+                            eventSource.Process();
+                            m_extraTopStats = "Sampled only 100K bytes";
+                        }
+                        else
+                        {
+                            return null;
+                        }
+
+                        return stackSource;
+                    }
             }
         }
 
         protected internal override void ConfigureStackWindow(string stackSourceName, StackWindow stackWindow)
         {
-            ConfigureAsEtwStackWindow(stackWindow, true, true, true, false);
+            ConfigureAsEtwStackWindow(stackWindow, false, true, true, false);
             if (stackSourceName.Contains("(with Tasks)") || stackSourceName.Contains("(with StartStop Activities)"))
             {
                 var taskFoldPat = "^STARTING TASK";
@@ -8541,6 +8877,16 @@ table {
             if (stackSourceName.Contains("Thread Time"))
             {
                 stackWindow.ScalingPolicy = ScalingPolicyKind.TimeMetric;
+            }
+
+            if (stackSourceName.StartsWith("GC Heap Net Mem") || stackSourceName.StartsWith("GC Heap Alloc Ignore Free"))
+            {
+                stackWindow.ComputeMaxInTopStats = true;
+            }
+
+            if(m_extraTopStats != null)
+            {
+                stackWindow.ExtraTopStats += " " + m_extraTopStats;
             }
         }
 
